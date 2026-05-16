@@ -102,7 +102,8 @@ $keys = $row ? json_decode($row['value'], true) : [];
 
 if(isset($_GET['nowpayment'])){
 
-      $dollarPrice = (int) file_get_contents(rtrim($botUrl, '/') . "/bot/api/Tether-Price.php");
+     $url = rtrim($botUrl, '/') . '/api/Tether-Price.php';
+     $dollarPrice = (int) file_get_contents($url);
 
     if($dollarPrice <= 0){
         showForm("خطا در دریافت قیمت تتر");

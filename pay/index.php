@@ -5,18 +5,35 @@ ini_set('display_errors', 1);
 include '../baseInfo.php';
 include '../config.php';
 
-//==================== INPUT ==============================
-
-if(empty($_GET['hash_id'])){
-    showForm("درخواست نامعتبر است");
-    exit;
+function showForm($msg){
+?>
+<html dir="rtl">
+<head>
+<meta charset="utf-8">
+<title><?php echo htmlspecialchars($msg); ?></title>
+</head>
+<body style="text-align:center;font-family:tahoma;padding-top:50px">
+<h2><?php echo htmlspecialchars($msg); ?></h2>
+</body>
+</html>
+<?php
+exit;
 }
 
-$hash_id = $_GET['hash_id'];
+//==================== INPUT ==============================
 
-if(!isset($_GET['zarinpal']) && !isset($_GET['nowpayment']) && !isset($_GET['nextpay'])){
+if (empty($_GET['hash_id'])) {
+    showForm("درخواست نامعتبر است");
+}
+
+$hash_id = trim($_GET['hash_id']);
+
+if (!preg_match('/^[a-zA-Z0-9_-]{10,80}$/', $hash_id)) {
+    showForm("شناسه نامعتبر است");
+}
+
+if (!isset($_GET['zarinpal']) && !isset($_GET['nowpayment']) && !isset($_GET['nextpay'])) {
     showForm("درگاه انتخاب نشده");
-    exit;
 }
 
 //==================== GET PAYMENT ==============================
@@ -27,9 +44,8 @@ $stmt->execute();
 $res = $stmt->get_result();
 $stmt->close();
 
-if($res->num_rows == 0){
+if ($res->num_rows == 0) {
     showForm("پرداخت یافت نشد");
-    exit;
 }
 
 $pay = $res->fetch_assoc();
@@ -38,14 +54,9 @@ $pay = $res->fetch_assoc();
 
 $plan_id = intval($pay['plan_id']);
 
-// 🔥 مهم‌ترین بخش: جلوگیری کامل از plan_id = 0
-if($plan_id <= 0){
-
-    // لاگ برای اینکه بفهمی مشکل از کجاست
+if ($plan_id <= 0) {
     error_log("INVALID PLAN_ID | hash_id: $hash_id | plan_id: ".$pay['plan_id']);
-
-    showForm("پرداخت نامعتبر است، لطفاً دوباره تلاش کنید");
-    exit;
+    showForm("پرداخت نامعتبر است");
 }
 
 //==================== GET PLAN ==============================
@@ -56,8 +67,8 @@ $stmt->execute();
 $planRes = $stmt->get_result();
 $stmt->close();
 
-// fallback با inbound_id
-if($planRes->num_rows == 0){
+if ($planRes->num_rows == 0) {
+
     $stmt = $connection->prepare("SELECT * FROM server_plans WHERE inbound_id=?");
     $stmt->bind_param("i", $plan_id);
     $stmt->execute();
@@ -65,19 +76,22 @@ if($planRes->num_rows == 0){
     $stmt->close();
 }
 
-// اگر هیچ پلنی نبود
-if($planRes->num_rows == 0){
+if ($planRes->num_rows == 0) {
     error_log("PLAN NOT FOUND | plan_id: $plan_id | hash_id: $hash_id");
-
-    showForm("پرداخت در حال بررسی است، بعداً تلاش کنید");
-    exit;
+    showForm("پرداخت در حال بررسی است");
 }
 
 $plan = $planRes->fetch_assoc();
 
 //==================== DATA ==============================
 
-$amount = $pay['price'];
+$amount = intval($pay['price']);
+
+if ($amount <= 0) {
+    error_log("INVALID PRICE | hash_id: $hash_id");
+    showForm("مبلغ نامعتبر است");
+}
+
 $type = $pay['type'];
 $orderId = $pay['id'];
 
@@ -85,9 +99,9 @@ $orderId = $pay['id'];
 
 $desc = "پرداخت";
 
-if($type == "BUY_SUB") $desc = "خرید اکانت";
-elseif($type == "RENEW_ACCOUNT") $desc = "تمدید اکانت";
-elseif($type == "INCREASE_WALLET") $desc = "شارژ کیف پول";
+if ($type == "BUY_SUB") $desc = "خرید اکانت";
+elseif ($type == "RENEW_ACCOUNT") $desc = "تمدید اکانت";
+elseif ($type == "INCREASE_WALLET") $desc = "شارژ کیف پول";
 
 //==================== PAYMENT KEYS ==============================
 
@@ -100,14 +114,17 @@ $keys = $row ? json_decode($row['value'], true) : [];
 
 //==================== NOWPAYMENT ==============================
 
-if(isset($_GET['nowpayment'])){
+if (isset($_GET['nowpayment'])) {
 
-     $url = rtrim($botUrl, '/') . '/api/Tether-Price.php';
-     $dollarPrice = (int) file_get_contents($url);
+    if (empty($keys['nowpayment'])) {
+        showForm("درگاه فعال نیست");
+    }
 
-    if($dollarPrice <= 0){
+    $url = rtrim($botUrl, '/') . '/api/Tether-Price.php';
+    $dollarPrice = floatval(@file_get_contents($url));
+
+    if ($dollarPrice < 1000) {
         showForm("خطا در دریافت قیمت تتر");
-        exit;
     }
 
     $usd = round($amount / $dollarPrice, 2);
@@ -119,7 +136,7 @@ if(isset($_GET['nowpayment'])){
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
         CURLOPT_HTTPHEADER => [
-            "X-API-KEY: " . ($keys['nowpayment'] ?? ''),
+            "X-API-KEY: " . $keys['nowpayment'],
             "Content-Type: application/json"
         ],
         CURLOPT_POSTFIELDS => json_encode([
@@ -133,18 +150,16 @@ if(isset($_GET['nowpayment'])){
 
     $response = curl_exec($ch);
 
-    if(curl_errno($ch)){
+    if (curl_errno($ch)) {
         showForm("خطای اتصال به درگاه");
-        exit;
     }
 
     curl_close($ch);
 
     $res = json_decode($response);
 
-    if(!isset($res->invoice_url)){
+    if (!$res || empty($res->invoice_url)) {
         showForm("خطا در ساخت پرداخت");
-        exit;
     }
 
     $stmt = $connection->prepare("UPDATE pays SET payid=? WHERE hash_id=?");
@@ -155,11 +170,16 @@ if(isset($_GET['nowpayment'])){
     header("Location: ".$res->invoice_url);
     exit;
 }
+
 //==================== ZARINPAL ==============================
 
-if(isset($_GET['zarinpal'])){
+if (isset($_GET['zarinpal'])) {
 
-    try{
+    if (empty($keys['zarinpal'])) {
+        showForm("درگاه فعال نیست");
+    }
+
+    try {
 
         $client = new SoapClient("https://www.zarinpal.com/pg/services/WebGate/wsdl");
 
@@ -170,18 +190,26 @@ if(isset($_GET['zarinpal'])){
             "CallbackURL" => $botUrl . "pay/back.php?zarinpal&hash_id=$hash_id"
         ]);
 
+        if (!isset($result->Status) || $result->Status != 100) {
+            showForm("خطا در زرین‌پال");
+        }
+
         header("Location: https://www.zarinpal.com/pg/StartPay/".$result->Authority);
         exit;
 
-    }catch(Exception $e){
-        showForm("خطا در زرین‌پال");
-        exit;
+    } catch (Exception $e) {
+        error_log("ZARINPAL ERROR: ".$e->getMessage());
+        showForm("خطا در اتصال زرین‌پال");
     }
 }
 
 //==================== NEXTPAY ==============================
 
-if(isset($_GET['nextpay'])){
+if (isset($_GET['nextpay'])) {
+
+    if (empty($keys['nextpay'])) {
+        showForm("درگاه فعال نیست");
+    }
 
     $ch = curl_init();
 
@@ -197,10 +225,15 @@ if(isset($_GET['nextpay'])){
         ])
     ]);
 
-    $res = json_decode(curl_exec($ch));
+    $response = curl_exec($ch);
+    $res = json_decode($response);
     curl_close($ch);
 
-    if(isset($res->code) && $res->code == -1){
+    if (!$res) {
+        showForm("خطا در پاسخ درگاه");
+    }
+
+    if (isset($res->code) && $res->code == -1 && !empty($res->trans_id)) {
 
         $stmt = $connection->prepare("UPDATE pays SET payid=? WHERE hash_id=?");
         $stmt->bind_param("ss", $res->trans_id, $hash_id);
@@ -212,26 +245,9 @@ if(isset($_GET['nextpay'])){
     }
 
     showForm("خطا در پرداخت");
-    exit;
 }
 
 //==================== ERROR ==============================
 
 showForm("درگاه نامعتبر");
-
-//==================== VIEW ==============================
-
-function showForm($msg){
-?>
-<html dir="rtl">
-<head>
-<meta charset="utf-8">
-<title><?php echo $msg; ?></title>
-</head>
-<body style="text-align:center;font-family:tahoma;padding-top:50px">
-<h2><?php echo $msg; ?></h2>
-</body>
-</html>
-<?php
-}
 ?>

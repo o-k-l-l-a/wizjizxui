@@ -1,137 +1,175 @@
-<?php 
+<?php
+
 include_once '../baseInfo.php';
 include_once '../config.php';
-include_once 'jdf.php';
 
-$rateLimit = $botState['rateLimit']??0;
-if(time() > $rateLimit){
-    $rate = json_decode(curl_get_file_contents("https://api.pooleno.ir/v1/currency/short-name/trx?type=buy"),true);
-    $botState['USDRate'] = round($rate['priceUsdt'],2);
-    $botState['TRXRate'] = round($rate['priceFiat'] / 10,2);
-    $botState['rateLimit'] = strtotime("+1 hour");
-    
-    $stmt = $connection->prepare("SELECT * FROM `setting` WHERE `type` = 'BOT_STATES'");
-    $stmt->execute();
-    $isExists = $stmt->get_result();
-    $stmt->close();
-    if($isExists->num_rows>0) $query = "UPDATE `setting` SET `value` = ? WHERE `type` = 'BOT_STATES'";
-    else $query = "INSERT INTO `setting` (`type`, `value`) VALUES ('BOT_STATES', ?)";
-    $newData = json_encode($botState);
-    
-    $stmt = $connection->prepare($query);
-    $stmt->bind_param("s", $newData);
-    $stmt->execute();
-    $stmt->close();
+/* ---------------- LOCK SYSTEM ---------------- */
+
+$lockFile = __DIR__ . "/broadcast.lock";
+
+if(file_exists($lockFile)){
+    exit; // جلوگیری از اجرای همزمان
 }
 
-$stmt = $connection->prepare("SELECT * FROM `send_list` WHERE `state` = 1 LIMIT 1");
+file_put_contents($lockFile, time());
+
+/* ---------------- CONFIG ---------------- */
+
+$batchSize = 30;          // کنترل سرعت
+$sleepMicro = 300000;     // 0.3 sec delay
+
+/* ---------------- GET TASK ---------------- */
+
+$stmt = $connection->prepare("SELECT * FROM send_list WHERE state=1 LIMIT 1");
 $stmt->execute();
-$list = $stmt->get_result();
+$task = $stmt->get_result()->fetch_assoc();
 $stmt->close();
 
-if($list->num_rows > 0){
-    $info = $list->fetch_assoc();
-    
-    $sendId = $info['id'];
-    $offset = $info['offset'];
-    $type = $info['type'];
-    $file_id = $info['file_id'];
-    $chat_id = $info['chat_id'];
-    $text = $info['text'];
-    $message_id = $info['message_id'];
-    
-    if($offset == '0'){
-        if($type == "forwardall") $msg = "عملیات هدایت همگانی شروع شد";
-        else $msg = "عملیات ارسال پیام همگانی شروع شد";
-        
-        bot('sendMessage',[
-            'chat_id'=>$admin,
-            'text'=>$msg
-            ]);
-    }
-    
-    $stmt = $connection->prepare("SELECT * FROM `users`ORDER BY `id` LIMIT 50 OFFSET ?");
-    $stmt->bind_param("i", $offset);
-    $stmt->execute();
-    $usersList = $stmt->get_result();
-    $stmt->close();
-    
-    $keys = json_encode([
-                'inline_keyboard' => [
-                    [['text'=>$buttonValues['start_bot'],'callback_data'=>"mainMenu"]]
-                    ]
-            ]);
-    if($usersList->num_rows > 0) {
-        while($user = $usersList->fetch_assoc()){
-            if($type == 'text'){
-                sendMessage($text,$keys,null,$user['userid']);
-            }elseif($type == 'music'){
-                bot('sendAudio',[
-                    'chat_id' => $user['userid'],
-                    'audio' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]);
-            }elseif($type == 'video'){
-                bot('sendVideo',[
-                    'chat_id' => $user['userid'],
-                    'video' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]);
-            }elseif($type == 'voice'){
-                bot('sendVoice',[
-                    'chat_id' => $user['userid'],
-                    'voice' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]);
-            }elseif($type == 'document'){
-                bot('sendDocument',[
-                    'chat_id' => $user['userid'],
-                    'document' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]);
-            }elseif($type == 'photo'){
-                bot('sendPhoto', [
-                    'chat_id' => $user['userid'],
-                    'photo' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]); 
-            }elseif($type == "forwardall"){
-                forwardmessage($user['userid'], $chat_id, $message_id);
-            }
-            else {
-                bot('sendDocument',[
-                    'chat_id' => $user['userid'],
-                    'document' => $file_id,
-                    'caption' => $text,
-                    'reply_markup'=>$keys
-                ]);
-            }
-            $offset++;
-        }
-        $stmt = $connection->prepare("UPDATE `send_list` SET `offset` = ? WHERE `id` = ?");
-        $stmt->bind_param("ii", $offset, $sendId);
-        $stmt->execute();
-        $stmt->close();
-    }else{
-        if($type == "forwardall") $msg = "عملیات هدایت همگانی با موفقیت انجام شد";
-        else $msg = "عملیات ارسال پیام همگانی با موفقیت انجام شد";
-        
-        bot('sendMessage',[
-            'chat_id'=>$admin,
-            'text'=>$msg . "\nبه " . $offset . " نفر پیامتو فرستادم"
-            ]);
-            
-        $stmt = $connection->prepare("DELETE FROM `send_list` WHERE `id` = ?");
-        $stmt->bind_param('i', $sendId);
-        $stmt->execute();
-        $stmt->close();
-    }
+if(!$task){
+    unlink($lockFile);
+    exit;
 }
 
+$taskId   = $task['id'];
+$offset   = (int)$task['offset'];
+$type     = $task['type'];
+$text     = $task['text'];
+$file_id  = $task['file_id'];
+$chat_id  = $task['chat_id'];
+$msg_id   = $task['message_id'];
+
+$sent = 0;
+$failed = 0;
+
+/* ---------------- LOAD USERS ---------------- */
+
+$stmt = $connection->prepare("
+    SELECT userid FROM users
+    ORDER BY id ASC
+    LIMIT ? OFFSET ?
+");
+
+$stmt->bind_param("ii", $batchSize, $offset);
+$stmt->execute();
+$res = $stmt->get_result();
+$stmt->close();
+
+/* ---------------- DONE ---------------- */
+
+if($res->num_rows == 0){
+
+    sendMessage(
+        "✅ Broadcast کامل شد\n📊 Sent: {$task['sent']}\n❌ Failed: {$task['failed']}",
+        null,
+        null,
+        $admin
+    );
+
+    $stmt = $connection->prepare("DELETE FROM send_list WHERE id=?");
+    $stmt->bind_param("i", $taskId);
+    $stmt->execute();
+    $stmt->close();
+
+    unlink($lockFile);
+    exit;
+}
+
+/* ---------------- KEYBOARD ---------------- */
+
+$keys = json_encode([
+    'inline_keyboard' => [
+        [
+            ['text' => $buttonValues['start_bot'] ?? 'Start', 'callback_data' => "mainMenu"]
+        ]
+    ]
+]);
+
+/* ---------------- SEND LOOP ---------------- */
+
+while($u = $res->fetch_assoc()){
+
+    $uid = $u['userid'];
+
+    $ok = false;
+
+    try {
+
+        switch($type){
+
+            case 'text':
+                $ok = sendMessage($text, $keys, null, $uid);
+                break;
+
+            case 'photo':
+                $ok = bot('sendPhoto', [
+                    'chat_id'=>$uid,
+                    'photo'=>$file_id,
+                    'caption'=>$text,
+                    'reply_markup'=>$keys
+                ]);
+                break;
+
+            case 'video':
+                $ok = bot('sendVideo', [
+                    'chat_id'=>$uid,
+                    'video'=>$file_id,
+                    'caption'=>$text,
+                    'reply_markup'=>$keys
+                ]);
+                break;
+
+            case 'audio':
+                $ok = bot('sendAudio', [
+                    'chat_id'=>$uid,
+                    'audio'=>$file_id,
+                    'caption'=>$text,
+                    'reply_markup'=>$keys
+                ]);
+                break;
+
+            case 'document':
+                $ok = bot('sendDocument', [
+                    'chat_id'=>$uid,
+                    'document'=>$file_id,
+                    'caption'=>$text,
+                    'reply_markup'=>$keys
+                ]);
+                break;
+
+            case 'forwardall':
+                $ok = forwardmessage($uid, $chat_id, $msg_id);
+                break;
+        }
+
+        if($ok){
+            $sent++;
+        } else {
+            $failed++;
+        }
+
+    } catch(Exception $e){
+        $failed++;
+    }
+
+    usleep($sleepMicro); // مهم برای جلوگیری از flood
+}
+
+/* ---------------- UPDATE PROGRESS ---------------- */
+
+$stmt = $connection->prepare("
+    UPDATE send_list
+    SET offset = offset + ?,
+        sent = sent + ?,
+        failed = failed + ?
+    WHERE id = ?
+");
+
+$stmt->bind_param("iiii", $batchSize, $sent, $failed, $taskId);
+$stmt->execute();
+$stmt->close();
+
+/* ---------------- RELEASE LOCK ---------------- */
+
+unlink($lockFile);
 
 ?>
